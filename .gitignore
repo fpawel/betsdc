@@ -1,0 +1,5 @@
+debug
+.vscode
+*.exe
+.idea
+elm-stuff/
