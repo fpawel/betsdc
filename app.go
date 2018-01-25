@@ -1,27 +1,23 @@
 package main
 
 import (
-	"github.com/jmoiron/sqlx"
-	"github.com/fpawel/betfairs/aping/listMarketCatalogue"
-	"github.com/fpawel/betfairs/aping/listMarketBook"
-	"os"
+	"encoding/json"
 	"fmt"
-	"log"
-	"io/ioutil"
+	"github.com/fpawel/betfairs/aping"
 	"github.com/fpawel/betfairs/event2"
 	"github.com/fpawel/betfairs/football"
-	"github.com/fpawel/betfairs/aping"
+	"github.com/jmoiron/sqlx"
+	"io/ioutil"
+	"log"
 	"net/http"
-	"encoding/json"
+	"os"
 
 	_ "github.com/lib/pq"
-	"time"
 )
 
-type App struct{
-	db *sqlx.DB
-	mcr *listMarketCatalogue.Reader
-	mbr *listMarketBook.Reader
+type App struct {
+	db  *sqlx.DB
+	apingSession *aping.Session
 }
 
 func (x App) Close() error {
@@ -30,83 +26,54 @@ func (x App) Close() error {
 
 func newApp() (x App) {
 
-	apingSession := aping.NewSession(os.Getenv("BETFAIR_LOGIN_USER"), os.Getenv("BETFAIR_LOGIN_PASS"))
-	fmt.Println(apingSession.GetSession())
-
-	x.mcr = listMarketCatalogue.New(apingSession)
-	x.mbr = listMarketBook.New(apingSession)
+	x.apingSession = aping.NewSession(os.Getenv("BETFAIR_LOGIN_USER"), os.Getenv("BETFAIR_LOGIN_PASS"))
+	fmt.Println(x.apingSession.GetSession())
 
 	var err error
-	x.db, err = sqlx.Connect("postgres", dbConnStr)
+	connStr := os.Getenv("BETFAIRS_DB_CONN_STR")
+	x.db, err = sqlx.Connect("postgres", connStr)
 	if err != nil {
 		log.Fatalln(err)
 	}
 	return
 }
 
-
-func (x App) processGameLive( game football.GameLive ) {
+func (x App) processGameLive(game football.GameLive) {
 	var mids []int
-	x.db.Select(&mids, "SELECT * FROM get_markets_ids_by_event_id($1, $2)", game.ID, game.OpenDate)
-	if mids == nil {
-		if err := x.addGameEvent(game.ID); err != nil {
-			fmt.Println("ERROR adding game:", game, err )
+	if err := x.db.Select(&mids, "SELECT * FROM get_markets_ids_by_event_id($1, $2)", game.ID, game.OpenDate); err != nil {
+		log.Fatal(err)
+	}
+	if len(mids) == 0{
+		if err := dbAddGameEvent(x.db, game); err != nil {
+			fmt.Println("ERROR adding game:", game, err)
 			return
 		}
 	}
 	var marketIDs []aping.MarketID
-	for _,n := range mids{
+	for _, n := range mids {
 		marketIDs = append(marketIDs, aping.MarketID(fmt.Sprintf("1.%d", n)))
 	}
-	mbs,err := x.mbr.Read(marketIDs, 5 * time.Second)
+	mbs, err := x.apingSession.ListMarketBook(marketIDs)
 	if err != nil {
-		fmt.Println("ERROR reading prices:", game, err )
+		fmt.Println("ERROR reading prices:", game, err)
 		return
 	}
-	for _,m := range mbs{
-		for _,r := range m.Runners{
-			for n,p := range r.ExchangePrices.AvailableToBack{
-				_,err = x.db.NamedExec(
-					`
-	INSERT INTO prices 
-		( 	created_at, event_id, open_date, market_id, selection_id, side, price_index, 
-			game_minute, score_home, score_away, 
-			market_total_matched, market_total_available, 
-			runner_last_price_traded, 
-			price, size)
-	VALUES 
-		( 	current_date, :event_id, :open_date, :market_id, :selection_id, :side, :price_index,
-			:game_minute, :score_home, :score_away, 
-			:market_total_matched, :market_total_available, 
-			:runner_last_price_traded, 
-			:price, :size) `,
-					map[string]interface{}{
-						"event_id":         game.ID,
-						"open_date":        game.OpenDate,
-						"market_id":   	m.ID.Int(),
-						"selection_id": r.ID,
-						"side":            "B",
-						"price_index":  n,
-						"game_minute":     game.Minute,
-						"score_home": game.ScoreHome,
-						"score_away": game.ScoreAway,
-						"market_total_matched":m.TotalMatched,
-						"market_total_available":m.TotalAvailable,
-						"runner_last_price_traded":r.LastPriceTraded,
-						"price":p.Price,
-						"size":p.Size,
-					})
-				if err != nil {
-					log.Fatal(err )
-				}
+	for _, m := range mbs {
+		dbUpdateMarket(x.db, game, m)
+		for _, r := range m.Runners {
+			dbUpdateRunner(x.db, game, m, r)
+			for n, p := range r.ExchangePrices.AvailableToBack {
+				dbAddPrice(x.db, game, m, r, "B", n, p)
+			}
+			for n, p := range r.ExchangePrices.AvailableToLay {
+				dbAddPrice(x.db, game, m, r, "L", n, p)
 			}
 		}
 	}
-
 }
 
-func (x App) addGameEvent(gameID int) error {
-	r,err := http.Get(fmt.Sprintf("https://betfairs.herokuapp.com/event/%d", gameID))
+func dbAddGameEvent(db *sqlx.DB, game football.GameLive) error {
+	r, err := http.Get(fmt.Sprintf("https://betfairs.herokuapp.com/event/%d", game.ID))
 	if err != nil {
 		return err
 	}
@@ -117,9 +84,9 @@ func (x App) addGameEvent(gameID int) error {
 	}
 	var evt event2.Event
 	if err := json.Unmarshal(b, &evt); err != nil {
-		log.Fatal(err )
+		log.Fatal(err)
 	}
-	_,err = x.db.NamedExec(
+	_, err = db.NamedExec(
 		`SELECT add_event( :eventID, :openDate, :competitionID, :competitionName, :home, :away, :countryCode);`,
 		map[string]interface{}{
 			"eventID":         evt.ID,
@@ -131,10 +98,10 @@ func (x App) addGameEvent(gameID int) error {
 			"countryCode":     evt.CountryCode,
 		})
 	if err != nil {
-		log.Fatal(err )
+		log.Fatal(game, err)
 	}
-	for _, mrkt := range evt.Markets{
-		_,err = x.db.NamedExec(
+	for _, mrkt := range evt.Markets {
+		_, err = db.NamedExec(
 			`SELECT add_market( :eventID, :openDate, :marketID, :marketName);`,
 			map[string]interface{}{
 				"eventID":    evt.ID,
@@ -143,10 +110,10 @@ func (x App) addGameEvent(gameID int) error {
 				"marketName": mrkt.Name,
 			})
 		if err != nil {
-			log.Fatal(err )
+			log.Fatal(game, mrkt, err)
 		}
-		for _, rnr := range mrkt.Runners{
-			_,err = x.db.NamedExec(
+		for _, rnr := range mrkt.Runners {
+			_, err = db.NamedExec(
 				`SELECT add_runner( :eventID, :openDate, :marketID, :runnerID, :runnerName);`,
 				map[string]interface{}{
 					"eventID":    evt.ID,
@@ -156,7 +123,7 @@ func (x App) addGameEvent(gameID int) error {
 					"runnerName": rnr.Name,
 				})
 			if err != nil {
-				log.Fatal(err )
+				log.Fatal(game, mrkt, rnr,  err)
 			}
 
 		}
@@ -165,4 +132,75 @@ func (x App) addGameEvent(gameID int) error {
 	return nil
 }
 
+func dbAddPrice(db *sqlx.DB, game football.GameLive, m aping.MarketBook, r aping.Runner, side string, priceIndex int, p aping.PriceSize) {
+	_, err := db.NamedExec(
+		`
+INSERT INTO prices 
+(
+event_id, open_date, market_id, selection_id, side, price_index, 
+game_minute, score_home, score_away,
+price, size) 
+VALUES 
+( 	
+:event_id, :open_date, :market_id, :selection_id, :side, :price_index,
+:game_minute, :score_home, :score_away,
+:price, :size) `,
+		map[string]interface{}{
+			"event_id":                 game.ID,
+			"open_date":                game.OpenDate,
+			"market_id":                m.ID.Int(),
+			"selection_id":             r.ID,
+			"side":                     side,
+			"price_index":              priceIndex,
+			"game_minute":              game.Minute,
+			"score_home":               game.ScoreHome,
+			"score_away":               game.ScoreAway,
+			"price":                    p.Price,
+			"size":                     p.Size,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
 
+func dbUpdateMarket(db *sqlx.DB, game football.GameLive, m aping.MarketBook) {
+	_, err := db.NamedExec(
+		`
+SELECT update_market_total_matched(
+  :event_id,
+  :open_date,
+  :market_id,
+  :total_matched
+)`,
+		map[string]interface{}{
+			"event_id":        game.ID,
+			"open_date":       game.OpenDate,
+			"market_id":       m.ID.Int(),
+			"total_matched":   m.TotalMatched,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func dbUpdateRunner(db *sqlx.DB, game football.GameLive, m aping.MarketBook, r aping.Runner) {
+	_, err := db.NamedExec(
+		`
+SELECT update_runner_status(
+  :event_id,
+  :open_date,
+  :market_id,
+  :selection_id,
+  :status
+)`,
+		map[string]interface{}{
+			"event_id":          game.ID,
+			"open_date":         game.OpenDate,
+			"market_id":         m.ID.Int(),
+			"selection_id":      r.ID,
+			"status":            r.Status,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+}

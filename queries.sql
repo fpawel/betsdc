@@ -7,7 +7,11 @@ AS ENUM (
   'L'   -- ставка ПРОТИВ
 );
 
-TRUNCATE  runners, markets, events, competitions, teams CASCADE ;
+TRUNCATE prices, runners, runner_names, markets, events, competitions, teams CASCADE;
+
+drop TABLE prices, runners, runner_names, markets, events, competitions, teams CASCADE;
+drop TABLE prices, runners, runner_names, markets CASCADE ;
+drop TABLE prices,  runners CASCADE ;
 
 CREATE TABLE IF NOT EXISTS teams ( -- команды
   team_id SERIAL PRIMARY KEY,     -- идентификатор команды
@@ -22,7 +26,7 @@ CREATE TABLE IF NOT EXISTS competitions ( -- чемпионаты
 
 CREATE TABLE IF NOT EXISTS events ( -- неизменяемые характеристики футбольного матча
   event_id INT NOT NULL CONSTRAINT positive_event_id CHECK (event_id > 0),     -- идентификатор матча
-  open_date DATE NOT NULL,  -- дата матча
+  open_date TIMESTAMP NOT NULL,  -- дата матча
   competition_id INT NOT NULL,  -- чемпионат
   home_id INT NOT NULL,     -- команда дома
   away_id INT NOT NULL,     -- команда в гостях
@@ -40,15 +44,15 @@ CREATE TABLE IF NOT EXISTS events ( -- неизменяемые характер
 
 CREATE TABLE IF NOT EXISTS markets ( -- рынки
   event_id INT NOT NULL CONSTRAINT positive_event_id CHECK (event_id > 0),     -- идентификатор матча
-  open_date DATE NOT NULL,  -- дата матча
-  market_id INT NOT NULL CONSTRAINT positive_market_id CHECK (market_id > 0),   -- идентификатор рынка
+  open_date TIMESTAMP NOT NULL,  -- дата матча
+  market_id INT NOT NULL CONSTRAINT positive_market_id CHECK (market_id > 0) DEFAULT 0,   -- идентификатор рынка
   market_name TEXT NOT NULL CONSTRAINT market_name_is_not_empty_string CHECK (market_name <> ''),-- имя рынка
+  total_matched NUMERIC NOT NULL CONSTRAINT positive_total_matched CHECK (total_matched > 0 OR total_matched = 0) DEFAULT 0, -- совокупный объём совпавших пари
+  updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
   FOREIGN KEY (event_id,open_date)
   REFERENCES events (event_id,open_date) ON DELETE CASCADE,
   PRIMARY KEY (event_id, open_date, market_id)
 );
-
-
 CREATE TABLE IF NOT EXISTS runner_names (  -- наименование опции
   selection_id INT NOT NULL CONSTRAINT not_negative_selection_id CHECK (selection_id > -1),-- идентификатор опции рынка
   runner_name TEXT NOT NULL CONSTRAINT runner_name_is_not_empty_string CHECK (runner_name <> ''),-- имя опции
@@ -57,19 +61,22 @@ CREATE TABLE IF NOT EXISTS runner_names (  -- наименование опци�
 
 CREATE TABLE IF NOT EXISTS runners (  -- опции на рынках
   event_id INT NOT NULL CONSTRAINT positive_event_id CHECK (event_id > 0),    -- идентификатор матча
-  open_date DATE NOT NULL,  -- дата матча
+  open_date TIMESTAMP NOT NULL,  -- дата матча
   market_id INT NOT NULL CONSTRAINT positive_market_id CHECK (market_id > 0),   -- идентификатор рынка
   selection_id INT NOT NULL CONSTRAINT not_negative_selection_id CHECK (selection_id > -1),-- идентификатор опции рынка
-  status RUNNER_STATUS NOT NULL,  -- статус опции
+  status RUNNER_STATUS NOT NULL DEFAULT 'ACTIVE',  -- статус опции
+  updated_at TIMESTAMP NOT NULL DEFAULT current_timestamp,
+  FOREIGN KEY (selection_id)
+  REFERENCES runner_names (selection_id)  ON DELETE CASCADE,
   FOREIGN KEY (event_id, open_date, market_id)
   REFERENCES markets (event_id, open_date, market_id ) ON DELETE CASCADE,
   PRIMARY KEY (event_id, open_date, market_id, selection_id)
 );
 
 CREATE TABLE IF NOT EXISTS prices(  --
-  created_at DATE,          -- временная метка, фомируемая в момент добавления записи
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, -- временная метка, фомируемая в момент добавления записи
   event_id INT NOT NULL CONSTRAINT positive_event_id CHECK (event_id > 0),    -- идентификатор матча
-  open_date DATE NOT NULL,  -- дата матча
+  open_date TIMESTAMP NOT NULL,  -- дата матча
   market_id INT NOT NULL CONSTRAINT positive_market_id CHECK (market_id > 0),   -- идентификатор рынка
   selection_id INT NOT NULL CONSTRAINT not_negative_selection_id CHECK (selection_id > -1),-- идентификатор опции рынка
   side SIDE NOT NULL,       -- вид ставки: ЗА или ПРОТИВ
@@ -77,20 +84,11 @@ CREATE TABLE IF NOT EXISTS prices(  --
   game_minute SMALLINT NOT NULL CONSTRAINT positive_game_minute CHECK (game_minute > -1), -- минута матча
   score_home SMALLINT NOT NULL CONSTRAINT positive_score_home CHECK (score_home > -1), -- счёт матча: домашняя команда
   score_away SMALLINT NOT NULL CONSTRAINT positive_score_away CHECK (score_away > -1), -- счёт матча: команда в гостях
-  market_total_matched NUMERIC NOT NULL, -- совокупный объём совпавших пари на рынке опции, к которой относится котировка
-  market_total_available NUMERIC NOT NULL, -- совокупный объём доступных пари на рынке опции, к которой относится котировка
-  runner_last_price_traded NUMERIC NOT NULL, -- последний сыгрынный коэффициент для опции, к которой относится котировка
   price NUMERIC NOT NULL, -- значение доступного коэффициента
   size NUMERIC NOT NULL,  -- значение доступной ставки в долларах
   FOREIGN KEY (event_id, open_date, market_id, selection_id)
   REFERENCES runners (event_id, open_date, market_id, selection_id) ON DELETE CASCADE
 );
-
-
-INSERT INTO prices
-( created_at, event_id, open_date, market_id, selection_id, side, price_index, game_minute, score_home, score_away, market_total_matched, market_total_available, runner_last_price_traded, price, size)
-VALUES (current_date, '2018-01-20T10:00:00Z');
-
 
 CREATE OR REPLACE FUNCTION add_team( the_team_name text )
   RETURNS INT AS $$
@@ -113,8 +111,6 @@ END
 $$ LANGUAGE plpgsql;
 SELECT team('Спартак');
 
-
-
 CREATE OR REPLACE FUNCTION add_competition(the_competition_id INT, the_competition_name text )
   -- создать запись в таблице competitions если ключ (the_competition_id) не существует
   RETURNS VOID AS $$
@@ -123,13 +119,13 @@ BEGIN
   VALUES (the_competition_id, the_competition_name) ON CONFLICT (competition_id) DO NOTHING ;
 END
 $$ LANGUAGE plpgsql;
+
 SELECT competition(8596554, 'Israeli Liga Bet - North B');
 SELECT competition(821269, 'Spanish Tercera Division');
 
-
 CREATE OR REPLACE FUNCTION event_id_exits(
   the_event_id INT,
-  the_open_date DATE
+  the_open_date TIMESTAMP
 )
   RETURNS BOOLEAN AS $$
 BEGIN
@@ -139,7 +135,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION add_event(
   the_event_id INT,
-  the_open_date DATE,
+  the_open_date TIMESTAMP,
   the_competition_id INT,
   the_competition_name text,
   the_home text,
@@ -161,10 +157,9 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-
 CREATE OR REPLACE FUNCTION get_markets_ids_by_event_id(
   the_event_id  INT,
-  the_open_date DATE
+  the_open_date TIMESTAMP
 )
   RETURNS TABLE (market_id INT) AS $$
 BEGIN
@@ -195,10 +190,9 @@ SELECT add_market(8591154, '2018-02-20T10:00:00Z', 101, 'Счёт');
 SELECT * FROM get_markets_ids_by_event_id(8591154, '2018-02-20T10:00:00Z');
 SELECT * FROM get_markets_ids_by_event_id(596554, '2018-01-20T10:00:00Z');
 
-
 CREATE OR REPLACE FUNCTION add_market(
   the_event_id INT,
-  the_open_date DATE,
+  the_open_date TIMESTAMP,
   the_market_id INT,
   the_market_name text
 )
@@ -210,10 +204,9 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-
 CREATE OR REPLACE FUNCTION add_runner(
   the_event_id INT,
-  the_open_date DATE,
+  the_open_date TIMESTAMP,
   the_market_id INT,
   the_selection_id INT,
   the_runner_name TEXT
@@ -222,6 +215,15 @@ CREATE OR REPLACE FUNCTION add_runner(
 -- создать запись в таблице runners если данный ключ не существует в ней
 -- иначе устанвить соответствующее ключу значение status
 BEGIN
+  INSERT INTO runner_names(selection_id, runner_name)
+  VALUES (
+    the_selection_id,
+    the_runner_name
+  ) ON CONFLICT (selection_id) DO NOTHING;
+
+  INSERT INTO runner_names(selection_id, runner_name)
+  VALUES ( the_selection_id, the_runner_name )
+  ON CONFLICT (selection_id) DO NOTHING;
   INSERT INTO runners(event_id, open_date, market_id, selection_id, status)
   VALUES (
     the_event_id,
@@ -236,3 +238,60 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+
+
+CREATE OR REPLACE FUNCTION update_runner_status(
+  the_event_id INT,
+  the_open_date TIMESTAMP,
+  the_market_id INT,
+  the_selection_id INT,
+  the_status RUNNER_STATUS
+)
+  RETURNS VOID AS $$
+BEGIN
+  UPDATE runners
+  SET status = the_status, updated_at = current_timestamp
+  WHERE event_id = the_event_id AND open_date = the_open_date AND market_id = the_market_id AND selection_id = the_selection_id;
+END
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION update_market_total_matched(
+  the_event_id INT,
+  the_open_date TIMESTAMP,
+  the_market_id INT,
+  the_total_matched NUMERIC
+)
+  RETURNS VOID AS $$
+BEGIN
+  UPDATE markets
+  SET total_matched = the_total_matched, updated_at = current_timestamp
+  WHERE event_id = the_event_id AND open_date = the_open_date AND market_id = the_market_id;
+END
+$$ LANGUAGE plpgsql;
+
+SELECT count(*) FROM ( SELECT * FROM prices ) as aa;
+SELECT * FROM prices ORDER BY created_at DESC LIMIT 100;
+
+WITH AA as (
+    SELECT * FROM prices
+    WHERE market_id = 139304813 AND selection_id = 5181620 and side = 'B' AND price_index = 0
+    ORDER BY created_at DESC LIMIT 500
+)
+SELECT * FROM AA ORDER BY created_at ASC ;
+
+WITH AA as (
+    SELECT * FROM prices
+    ORDER BY created_at DESC LIMIT 500
+)
+SELECT * FROM AA ORDER BY created_at ASC ;
+
+SELECT event_id, market_id, total_matched FROM markets ORDER BY total_matched DESC LIMIT 5;
+
+SELECT * FROM prices WHERE side = 'L';
+
+WITH AA AS (
+    SELECT event_id, team_name as home, away_id FROM events e
+      INNER JOIN teams t ON e.home_id = t.team_id
+)
+SELECT event_id, home, team_name as away FROM AA INNER JOIN teams t ON away_id = t.team_id ;

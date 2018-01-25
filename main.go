@@ -7,17 +7,8 @@ import (
 	"github.com/fpawel/betfairs/football"
 	"encoding/json"
 
-
+	"time"
 )
-
-const dbConnStr = `
-user=postgres 
-password='falena190312' 
-dbname=betfairs 
-sslmode=disable
-host=localhost
-port=5432 `
-
 
 func main() {
 
@@ -27,9 +18,12 @@ func main() {
 
 	u := url.URL{Scheme: "wss", Host: "betfairs.herokuapp.com", Path: "/football/live"}
 	log.Println("connecting...")
+	dialer := &*websocket.DefaultDialer
+	dialer.HandshakeTimeout = 5 * time.Minute
 	mainLoop:
 	for {
-		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+
+		c, _, err := dialer.Dial(u.String(), nil)
 		if err != nil {
 			log.Fatal("dial:", err)
 		}
@@ -38,7 +32,7 @@ func main() {
 		for{
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				log.Println("read:", err)
+				log.Println("read:", message, string(message), ":", err)
 				c.Close()
 				log.Println("reconnecting...")
 				continue mainLoop
