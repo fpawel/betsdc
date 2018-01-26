@@ -30,6 +30,7 @@ func main() {
 		log.Println("connected!")
 
 		for{
+			app.processGamesWithUnknownStatus()
 			_, message, err := c.ReadMessage()
 			if err != nil {
 				log.Println("read:", message, string(message), ":", err)
